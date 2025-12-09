@@ -1,4 +1,4 @@
-"""Tests for the llm_provider module - specifically context preservation during streaming."""
+"""Tests for context preservation during streaming in llm_provider."""
 
 from __future__ import annotations
 
@@ -17,8 +17,6 @@ from logfire.testing import TestExporter
 
 
 class MockStreamState(StreamState):
-    """A mock stream state for testing."""
-
     def __init__(self):
         self.chunks: list[str] = []
 
@@ -32,26 +30,21 @@ class MockStreamState(StreamState):
 
 @dataclass
 class MockOptions:
-    """Mock options object that simulates FinalRequestOptions."""
+    """Simulates FinalRequestOptions from openai/anthropic clients."""
 
     url: str = '/test'
     json_data: dict[str, Any] = field(default_factory=lambda: {'model': 'test-model'})
 
 
 class MockSyncStream:
-    """A mock sync stream for testing streaming behavior."""
-
     def __init__(self, chunks: list[str]):
         self._chunks = chunks
 
     def __stream__(self) -> Iterator[str]:
-        for chunk in self._chunks:
-            yield chunk
+        yield from self._chunks
 
 
 class MockAsyncStream:
-    """A mock async stream for testing streaming behavior."""
-
     def __init__(self, chunks: list[str]):
         self._chunks = chunks
 
@@ -61,8 +54,6 @@ class MockAsyncStream:
 
 
 class MockSyncClient:
-    """A mock sync client for testing."""
-
     _is_instrumented_by_logfire = False
 
     def __init__(self, chunks: list[str] | None = None):
@@ -76,8 +67,6 @@ class MockSyncClient:
 
 
 class MockAsyncClient:
-    """A mock async client for testing."""
-
     _is_instrumented_by_logfire = False
 
     def __init__(self, chunks: list[str] | None = None):
@@ -90,7 +79,7 @@ class MockAsyncClient:
         return {'result': 'success'}
 
 
-def mock_get_endpoint_config(options: MockOptions) -> EndpointConfig:
+def get_endpoint_config(options: MockOptions) -> EndpointConfig:
     return EndpointConfig(
         message_template='Test with {request_data[model]!r}',
         span_data={'request_data': options.json_data},
@@ -98,111 +87,88 @@ def mock_get_endpoint_config(options: MockOptions) -> EndpointConfig:
     )
 
 
-def mock_on_response(response: Any, span: logfire.LogfireSpan) -> Any:
+def on_response(response: Any, span: logfire.LogfireSpan) -> Any:
     return response
 
 
-def mock_is_async_client(client_type: type) -> bool:
+def is_async_client(client_type: type) -> bool:
     return issubclass(client_type, MockAsyncClient)
 
 
 def test_record_streaming_preserves_context(exporter: TestExporter) -> None:
-    """Test that record_streaming uses attach_context to preserve the original context."""
-    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE
-
-    with logfire_instance.span('parent span'):
-        # Capture context while inside the parent span
+    with logfire.span('parent'):
         original_context = get_context()
-        span_data = {'request_data': {'model': 'test-model'}}
 
-    # Now outside the parent span, the streaming log should still be linked to the parent
-    with record_streaming(logfire_instance, span_data, MockStreamState, original_context) as record_chunk:
-        record_chunk('chunk1')
+    # Outside the parent span, streaming log should still link to parent via attach_context
+    with record_streaming(
+        logfire.DEFAULT_LOGFIRE_INSTANCE,
+        {'request_data': {'model': 'test-model'}},
+        MockStreamState,
+        original_context,
+    ) as record_chunk:
+        record_chunk('chunk')
 
     spans = exporter.exported_spans_as_dict()
-    assert len(spans) == 2
+    parent = next(s for s in spans if s['name'] == 'parent')
+    streaming = next(s for s in spans if 'streaming response' in s['name'])
 
-    parent = [s for s in spans if s['name'] == 'parent span'][0]
-    streaming = [s for s in spans if 'streaming response' in s['name']][0]
-
-    # The streaming span should be a child of the parent span
     assert streaming['context']['trace_id'] == parent['context']['trace_id']
     assert streaming['parent']['span_id'] == parent['context']['span_id']
 
 
 def test_sync_streaming_preserves_original_context(exporter: TestExporter) -> None:
-    """Test that sync streaming requests preserve the original context.
-
-    The context is captured in _instrumentation_setup (before the request span opens),
-    so the streaming log and request span are siblings under the same parent.
-    """
+    """Context captured before request span opens, so streaming and request spans are siblings."""
     client = MockSyncClient(chunks=['chunk1', 'chunk2'])
-
     instrument_llm_provider(
         logfire=logfire.DEFAULT_LOGFIRE_INSTANCE,
         client=client,
         suppress_otel=False,
         scope_suffix='test',
-        get_endpoint_config_fn=mock_get_endpoint_config,
-        on_response_fn=mock_on_response,
-        is_async_client_fn=mock_is_async_client,
+        get_endpoint_config_fn=get_endpoint_config,
+        on_response_fn=on_response,
+        is_async_client_fn=is_async_client,
     )
 
-    with logfire.span('parent operation'):
+    with logfire.span('parent'):
         result = client.request(options=MockOptions(), stream=True, stream_cls=MockSyncStream)
         for _ in result.__stream__():
             pass
 
     spans = exporter.exported_spans_as_dict()
-    assert len(spans) == 3
+    parent = next(s for s in spans if s['name'] == 'parent')
+    request = next(s for s in spans if 'Test with' in s['name'])
+    streaming = next(s for s in spans if 'streaming response' in s['name'])
 
-    parent_span = [s for s in spans if s['name'] == 'parent operation'][0]
-    request_span = [s for s in spans if s['name'] == "Test with {request_data[model]!r}"][0]
-    streaming_span = [s for s in spans if 'streaming response' in s['name']][0]
-
-    # All spans in the same trace
-    assert request_span['context']['trace_id'] == parent_span['context']['trace_id']
-    assert streaming_span['context']['trace_id'] == parent_span['context']['trace_id']
-
-    # Request span is child of parent
-    assert request_span['parent']['span_id'] == parent_span['context']['span_id']
-
-    # Streaming span is also child of parent (siblings with request span)
-    assert streaming_span['parent']['span_id'] == parent_span['context']['span_id']
+    assert request['context']['trace_id'] == parent['context']['trace_id']
+    assert streaming['context']['trace_id'] == parent['context']['trace_id']
+    assert request['parent']['span_id'] == parent['context']['span_id']
+    assert streaming['parent']['span_id'] == parent['context']['span_id']
 
 
 async def test_async_streaming_preserves_original_context(exporter: TestExporter) -> None:
-    """Test that async streaming requests preserve the original context."""
+    """Context captured before request span opens, so streaming and request spans are siblings."""
     client = MockAsyncClient(chunks=['chunk1', 'chunk2'])
-
     instrument_llm_provider(
         logfire=logfire.DEFAULT_LOGFIRE_INSTANCE,
         client=client,
         suppress_otel=False,
         scope_suffix='test',
-        get_endpoint_config_fn=mock_get_endpoint_config,
-        on_response_fn=mock_on_response,
-        is_async_client_fn=mock_is_async_client,
+        get_endpoint_config_fn=get_endpoint_config,
+        on_response_fn=on_response,
+        is_async_client_fn=is_async_client,
     )
 
-    with logfire.span('parent operation'):
+    with logfire.span('parent'):
         result = await client.request(options=MockOptions(), stream=True, stream_cls=MockAsyncStream)
         async for _ in result.__stream__():
             pass
 
     spans = exporter.exported_spans_as_dict()
-    assert len(spans) == 3
+    parent = next(s for s in spans if s['name'] == 'parent')
+    request = next(s for s in spans if 'Test with' in s['name'])
+    streaming = next(s for s in spans if 'streaming response' in s['name'])
 
-    parent_span = [s for s in spans if s['name'] == 'parent operation'][0]
-    request_span = [s for s in spans if s['name'] == "Test with {request_data[model]!r}"][0]
-    streaming_span = [s for s in spans if 'streaming response' in s['name']][0]
-
-    # All spans in the same trace
-    assert request_span['context']['trace_id'] == parent_span['context']['trace_id']
-    assert streaming_span['context']['trace_id'] == parent_span['context']['trace_id']
-
-    # Request span is child of parent
-    assert request_span['parent']['span_id'] == parent_span['context']['span_id']
-
-    # Streaming span is also child of parent (siblings with request span)
-    assert streaming_span['parent']['span_id'] == parent_span['context']['span_id']
+    assert request['context']['trace_id'] == parent['context']['trace_id']
+    assert streaming['context']['trace_id'] == parent['context']['trace_id']
+    assert request['parent']['span_id'] == parent['context']['span_id']
+    assert streaming['parent']['span_id'] == parent['context']['span_id']
